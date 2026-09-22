@@ -152,8 +152,6 @@ function Copy-ToShadowSlot($sourceDirectoryPath, $slotDirectoryPath) {
 }
 
 function Test-OutputChanged($sourceDirectoryPath, $slotDirectoryPath, $assemblyName) {
-    # REVIEW: Only the main assembly is compared, so a rebuild that changes just a referenced
-    # project/NuGet dll leaves the shadow slot stale and the reload silently runs old dependencies.
     $sourceAssemblyPath = Join-Path $sourceDirectoryPath "$assemblyName.dll"
     if (!(Test-Path $sourceAssemblyPath -PathType Leaf)) {
         throw "Build output '$sourceAssemblyPath' is not found. Build the project first."
