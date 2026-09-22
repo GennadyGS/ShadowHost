@@ -161,9 +161,8 @@ $contentRoot = $contentRoot ?? $project.ProjectDirectoryPath
 if (!(Test-Path $outputPath -PathType Container)) {
     throw "Build output '$outputPath' is not found. Build the project first."
 }
-# REVIEW: Check-then-write is racy - two supervisors started concurrently for the same project both
-# pass this test and then clobber each other's state.json. A lock file / mutex would be safer.
-if (Read-ServiceState $projectName) {
+$serviceLock = Lock-ServiceState $projectName
+if (!$serviceLock) {
     throw "A shadow host supervisor is already running for '$projectName'. Stop it first."
 }
 
@@ -231,5 +230,6 @@ finally {
     Unregister-OutputWatcher $watcher
     if ($child -and !$child.HasExited) { Stop-ProcessGracefully $child.Id $shutdownTimeoutSeconds }
     Remove-ServiceState $projectName
+    Unlock-ServiceState $serviceLock
     Write-ShadowHostLog "Supervisor stopped."
 }

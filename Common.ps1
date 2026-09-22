@@ -172,6 +172,27 @@ function Get-ServiceStatePath($projectName) {
     Join-Path (Get-ShadowRootPath $projectName) "state.json"
 }
 
+function Get-ServiceLockPath($projectName) {
+    Join-Path (Get-ShadowRootPath $projectName) "state.lock"
+}
+
+# Held open (not deleted) for the supervisor's lifetime; the OS releases it even on a hard crash,
+# so acquiring it is an atomic single-owner check that a separate check-then-write can't provide.
+function Lock-ServiceState($projectName) {
+    $lockPath = Get-ServiceLockPath $projectName
+    New-Item (Get-ShadowRootPath $projectName) -ItemType Directory -Force | Out-Null
+    try {
+        [IO.File]::Open($lockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    }
+    catch [IO.IOException] {
+        $null
+    }
+}
+
+function Unlock-ServiceState($lockHandle) {
+    if ($lockHandle) { $lockHandle.Dispose() }
+}
+
 function Test-ProcessIdentity($processId, $startTime, $processName) {
     if (!$processId) { return $false }
 
