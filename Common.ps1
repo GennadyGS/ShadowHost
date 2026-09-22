@@ -222,9 +222,7 @@ function Stop-ProcessGracefully($processId, [int] $timeoutSeconds = 10) {
     $signalSent = $signaler.HasExited -and $signaler.ExitCode -eq 0
 
     if (!($signalSent -and $process.WaitForExit($timeoutSeconds * 1000))) {
-        # REVIEW: Bare string output here goes to the success stream and pollutes callers that
-        # capture this function's result; use Write-Host/Write-Warning like the rest of the module.
-        "Process $processId did not exit gracefully. Terminating..."
+        Write-Warning "Process $processId did not exit gracefully. Terminating..."
         TaskKill.exe /pid $processId /t /f | Out-Null
         $process.WaitForExit(5000) | Out-Null
     }
