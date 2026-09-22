@@ -110,12 +110,17 @@ function Start-ShadowChild($slotPath) {
     $launchPath = $useAppHost ? $appHostPath : "dotnet"
     $arguments = @($(if (!$useAppHost) { "`"$(Join-Path $slotPath "$assemblyName.dll")`"" }), "--contentRoot", "`"$contentRoot`"") | Where-Object { $_ }
 
+    # Per-run file names so a reload or crash-restart doesn't truncate the previous run's log.
+    $logTimestamp = Get-Date -Format "yyyyMMdd-HHmmss-fff"
+    $script:stdoutLogPath = Join-Path $logDirectoryPath "stdout.$logTimestamp.log"
+    $script:stderrLogPath = Join-Path $logDirectoryPath "stderr.$logTimestamp.log"
+
     Write-ShadowHostLog "Starting $launchPath $arguments"
     # Working directory matters too - some apps resolve appsettings.json via the current directory.
-    # REVIEW: -RedirectStandardOutput/-RedirectStandardError truncate the log files on every reload
-    # and crash-restart, so the output of the run that actually failed is lost. Append or use a
-    # per-run file name.
-    $childProcess = Start-Process $launchPath -ArgumentList $arguments -PassThru -WindowStyle Hidden `
+    $childProcess = Start-Process $launchPath `
+        -ArgumentList $arguments `
+        -PassThru `
+        -WindowStyle Hidden `
         -WorkingDirectory $contentRoot `
         -RedirectStandardOutput $stdoutLogPath -RedirectStandardError $stderrLogPath
     Write-ShadowHostLog "Running as process $($childProcess.Id). Logs: '$stdoutLogPath'"
@@ -166,8 +171,8 @@ $launchSettings = Get-ServiceLaunchSettings $project.ProjectDirectoryPath $launc
 $serviceUrls = $urls ?? ${launchSettings}?.Urls
 
 $logDirectoryPath = Join-Path (Get-ShadowRootPath $projectName) "logs"
-$stdoutLogPath = Join-Path $logDirectoryPath "stdout.log"
-$stderrLogPath = Join-Path $logDirectoryPath "stderr.log"
+$stdoutLogPath = $null
+$stderrLogPath = $null
 
 $supervisorProcess = Get-Process -Id $PID
 $markerSeen = Test-Path (Join-Path $outputPath $triggerFileName) -PathType Leaf
