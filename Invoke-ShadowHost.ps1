@@ -17,6 +17,8 @@ param (
 $triggerFileName = ".shadowhost-trigger"
 $watcherSourceIdentifier = "ShadowHost.OutputWatcher"
 $pollIntervalMilliseconds = 200
+$activationPollIntervalMilliseconds = 50
+$childBindTimeoutSeconds = 60
 $crashWindowSeconds = 60
 $crashLimit = 5
 
@@ -97,8 +99,118 @@ function Update-ShadowSlot($currentSlot) {
     $slot
 }
 
+function Get-ListenerEndpoints($serviceUrls) {
+    foreach ($url in $serviceUrls) {
+        if (!($url -match "^(?<scheme>https?)://(?<host>\[[^\]]+\]|[^:/]+)(:(?<port>\d+))?")) {
+            throw "Cannot parse the listening url '$url'"
+        }
+        $port = $Matches.port ? [int] $Matches.port : ($Matches.scheme -eq "https" ? 443 : 80)
+        $urlHost = $Matches.host.Trim("[", "]")
+
+        # A wildcard binding is one dual-mode socket; a named host can resolve to both IPv4 and IPv6
+        # ("localhost" does), and Kestrel binds all of them, so the idle listener must match.
+        if ($urlHost -in "*", "+", "0.0.0.0", "::") {
+            [Net.IPEndPoint]::new([Net.IPAddress]::IPv6Any, $port)
+            continue
+        }
+        foreach ($address in [Net.Dns]::GetHostAddresses($urlHost)) {
+            [Net.IPEndPoint]::new($address, $port)
+        }
+    }
+}
+
+function Get-AcceptedEndPoint($client) {
+    # The address the caller actually reached is exactly what the child will bind. A dual-mode
+    # listener reports it IPv4-mapped, which an IPv6-only client socket cannot connect back to.
+    $localEndPoint = [Net.IPEndPoint] $client.Client.LocalEndPoint
+    $address = $localEndPoint.Address.IsIPv4MappedToIPv6 `
+        ? $localEndPoint.Address.MapToIPv4()
+        : $localEndPoint.Address
+    [Net.IPEndPoint]::new($address, $localEndPoint.Port)
+}
+
 function Wait-ActivationRequest {
-    Write-ShadowHostLog "Lazy activation is not available yet - activating immediately."
+    if (!$serviceUrls) {
+        Write-ShadowHostLog "No urls are configured - starting without waiting for a connection."
+        return @()
+    }
+
+    $listeners = @()
+    try {
+        foreach ($endpoint in Get-ListenerEndpoints $serviceUrls) {
+            $listener = [Net.Sockets.TcpListener]::new($endpoint)
+            if ($endpoint.Address.Equals([Net.IPAddress]::IPv6Any)) { $listener.Server.DualMode = $true }
+            $listener.Start()
+            $listeners += $listener
+        }
+        Write-ShadowHostLog "Idle. Waiting for the first connection on '$($serviceUrls -join ";")'."
+
+        while ($true) {
+            $pendingListeners = @($listeners | Where-Object { $_.Pending() })
+            if ($pendingListeners) {
+                # Drain everything already queued, so a browser's parallel connections survive activation.
+                return @(foreach ($listener in $pendingListeners) {
+                    while ($listener.Pending()) {
+                        $client = $listener.AcceptTcpClient()
+                        @{ Client = $client; EndPoint = Get-AcceptedEndPoint $client }
+                    }
+                })
+            }
+            Update-TriggerDeadline
+            Start-Sleep -Milliseconds $activationPollIntervalMilliseconds
+        }
+    }
+    finally {
+        # Release the ports before the child tries to bind them; accepted sockets stay open.
+        foreach ($listener in $listeners) { $listener.Stop() }
+    }
+}
+
+function Connect-ChildEndPoint($endPoint, $childProcess) {
+    $deadline = [datetime]::UtcNow.AddSeconds($childBindTimeoutSeconds)
+    while ([datetime]::UtcNow -lt $deadline -and !$childProcess.HasExited) {
+        $upstream = [Net.Sockets.TcpClient]::new($endPoint.AddressFamily)
+        try {
+            $upstream.Connect($endPoint)
+            return $upstream
+        }
+        catch [Net.Sockets.SocketException] {
+            $upstream.Dispose()
+            Start-Sleep -Milliseconds 100
+        }
+    }
+    $null
+}
+
+# Raw byte relay of the one socket that triggered activation - no HTTP parsing, so TLS passes
+# through untouched. Every later connection reaches the child directly.
+function Add-ConnectionRelay($pending, $childProcess) {
+    $upstream = Connect-ChildEndPoint $pending.EndPoint $childProcess
+    if (!$upstream) {
+        Write-ShadowHostLog "Child is not listening on '$($pending.EndPoint)' - dropping the pending connection."
+        $pending.Client.Close()
+        return
+    }
+
+    $pending.Client.NoDelay = $true
+    $upstream.NoDelay = $true
+    $clientStream = $pending.Client.GetStream()
+    $upstreamStream = $upstream.GetStream()
+    $script:relays += @{
+        Client = $pending.Client
+        Upstream = $upstream
+        Tasks = @($clientStream.CopyToAsync($upstreamStream), $upstreamStream.CopyToAsync($clientStream))
+    }
+}
+
+function Update-ConnectionRelays([switch] $closeAll) {
+    foreach ($relay in @($script:relays)) {
+        # One finished direction means that peer is gone; drop the other half instead of leaking it.
+        if (!$closeAll -and !($relay.Tasks | Where-Object { $_.IsCompleted })) { continue }
+        $relay.Client.Close()
+        $relay.Upstream.Close()
+        $script:relays = @($script:relays | Where-Object { $_ -ne $relay })
+    }
 }
 
 function Start-ShadowChild($slotPath) {
@@ -130,6 +242,7 @@ function Start-ShadowChild($slotPath) {
 function Wait-ReloadOrExit($childProcess) {
     while (!$childProcess.HasExited) {
         Update-TriggerDeadline
+        Update-ConnectionRelays
         if (Test-ReloadRequired) { return "Reload" }
         Start-Sleep -Milliseconds $pollIntervalMilliseconds
     }
@@ -191,25 +304,33 @@ $liveSlotPath = $null
 $child = $null
 $crashTimes = @()
 $watcher = $null
+$relays = @()
 try {
     if (!$noWatch) { $watcher = Register-OutputWatcher $outputPath }
 
     while ($true) {
         Write-ShadowHostState "Idle" $null $liveSlot
-        if (!$eager) { Wait-ActivationRequest }
+        $pendingConnections = $eager ? @() : (Wait-ActivationRequest)
+
+        # Triggers queued while idle are moot - the copy below already takes the newest output.
+        Update-TriggerDeadline
+        $triggerDeadline = $null
 
         $liveSlot = Update-ShadowSlot $liveSlot
         $liveSlotPath = Get-ShadowSlotPath $projectName $liveSlot
         $child = Start-ShadowChild $liveSlotPath
         Write-ShadowHostState "Running" $child $liveSlot
+        foreach ($pending in $pendingConnections) { Add-ConnectionRelay $pending $child }
 
         if ((Wait-ReloadOrExit $child) -eq "Reload") {
             Write-ShadowHostLog "New build detected. Reloading..."
             Stop-ProcessGracefully $child.Id $shutdownTimeoutSeconds
+            Update-ConnectionRelays -closeAll
             $crashTimes = @()
             $child = $null
             continue
         }
+        Update-ConnectionRelays -closeAll
 
         $exitCode = $child.ExitCode
         $child = $null
@@ -228,6 +349,7 @@ try {
 }
 finally {
     Unregister-OutputWatcher $watcher
+    Update-ConnectionRelays -closeAll
     if ($child -and !$child.HasExited) { Stop-ProcessGracefully $child.Id $shutdownTimeoutSeconds }
     Remove-ServiceState $projectName
     Unlock-ServiceState $serviceLock
