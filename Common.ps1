@@ -196,12 +196,13 @@ function Test-ProcessIdentity($processId, $startTime, $processName) {
 
     $process = Get-Process -Id $processId -ErrorAction Ignore
     if (!$process) { return $false }
-    if ($processName -and $process.ProcessName -ne $processName) { return $false }
-
     $expectedStartTime = $startTime -as [datetime]
-    if ($expectedStartTime -and [Math]::Abs(($expectedStartTime - $process.StartTime).TotalSeconds) -gt 1) {
-        return $false
+    if ($startTime) {
+        if (!$expectedStartTime) { return $false }
+        # An in-place PowerShell update can rename the running executable without replacing the process.
+        return [Math]::Abs(($expectedStartTime.ToUniversalTime() - $process.StartTime.ToUniversalTime()).TotalSeconds) -le 1
     }
+    if ($processName -and $process.ProcessName -ne $processName) { return $false }
     $true
 }
 
@@ -220,6 +221,58 @@ function Read-ServiceState($projectName) {
         return $null
     }
     $state
+}
+
+function Find-ServiceState($projectFilePath) {
+    $projectFilePath = (Resolve-Path $projectFilePath).Path
+    $projectDirectoryPath = Split-Path $projectFilePath -Parent
+    $supervisorScriptPath = Join-Path $PSScriptRoot "Invoke-ShadowHost.ps1"
+    $scriptPattern = '(?i)(?:^|\s)-File\s+(?:"{0}"|{0})(?=\s|$)' -f [regex]::Escape($supervisorScriptPath)
+    $projectPattern = '(?i)(?:^|\s)-projectPath\s+(?:"([^"]+)"|(\S+))'
+
+    $supervisors = @(Get-CimInstance Win32_Process -Filter "Name = 'pwsh.exe'" -ErrorAction Stop | Where-Object {
+        $commandLine = $_.CommandLine -replace '/', '\'
+        if ($commandLine -notmatch $scriptPattern) { return $false }
+        $projectArgument = [regex]::Match($commandLine, $projectPattern)
+        if (!$projectArgument.Success) { return $false }
+        $candidatePath = $projectArgument.Groups[1].Success `
+            ? $projectArgument.Groups[1].Value : $projectArgument.Groups[2].Value
+        $candidatePath = $candidatePath.TrimEnd('\')
+        $candidatePath -eq $projectFilePath -or $candidatePath -eq $projectDirectoryPath
+    })
+    if (!$supervisors) { return $null }
+    if ($supervisors.Count -gt 1) {
+        throw "Multiple shadow host supervisors were found for '$projectFilePath'. Refusing to choose one."
+    }
+
+    $supervisor = $supervisors[0]
+    if (!(Test-ProcessIdentity $supervisor.ProcessId $supervisor.CreationDate)) { return $null }
+
+    $projectName = [IO.Path]::GetFileNameWithoutExtension($projectFilePath)
+    $assemblyName = ResolveProjectProperty $projectFilePath "AssemblyName"
+    $appHostPaths = @()
+    $assemblyPatterns = @()
+    foreach ($slot in "a", "b") {
+        $slotPath = Get-ShadowSlotPath $projectName $slot
+        $appHostPaths += Join-Path $slotPath "$assemblyName.exe"
+        $assemblyPath = Join-Path $slotPath "$assemblyName.dll"
+        $assemblyPatterns += '(?i)(?:^|\s)(?:"{0}"|{0})(?=\s|$)' -f [regex]::Escape($assemblyPath)
+    }
+    $children = @(Get-CimInstance Win32_Process -Filter "ParentProcessId = $($supervisor.ProcessId)" -ErrorAction Stop | Where-Object {
+        $_.ExecutablePath -in $appHostPaths -or
+            ($_.Name -eq "dotnet.exe" -and $_.CommandLine -match ($assemblyPatterns -join "|"))
+    })
+    if ($children.Count -gt 1) {
+        throw "Multiple shadow host children were found for '$projectFilePath'. Refusing to choose one."
+    }
+    $child = $children | Select-Object -First 1
+    Write-Warning "Recovering shadow host for '$projectName' from its process command line because its state is missing or stale."
+    @{
+        supervisorPid = $supervisor.ProcessId
+        supervisorStartTime = $supervisor.CreationDate
+        childPid = ${child}?.ProcessId
+        childStartTime = ${child}?.CreationDate
+    }
 }
 
 function Remove-ServiceState($projectName) {

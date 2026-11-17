@@ -31,7 +31,7 @@ $stderrLogPath = Join-Path $logDirectoryPath "$logNameSafe.err.log"
 $arguments = @(
     "-NoProfile"
     "-File"; "`"$shadowHostScriptPath`""
-    "-projectPath"; "`"$projectPath`""
+    "-projectPath"; "`"$($project.ProjectFilePath)`""
     "-environment"; $environment
     "-configuration"; $configuration
     "-debounceMilliseconds"; $debounceMilliseconds

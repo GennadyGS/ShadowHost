@@ -9,6 +9,8 @@ $projectFilePath = Get-ProjectFilePath $projectPath
 $projectName = [IO.Path]::GetFileNameWithoutExtension($projectFilePath)
 
 $state = Read-ServiceState $projectName
+# Older stop attempts may have removed the state after an executable rename invalidated its name.
+if (!$state) { $state = Find-ServiceState $projectFilePath }
 if (!$state) {
     "No running shadow host is found for '$projectName'."
     Remove-ServiceState $projectName
